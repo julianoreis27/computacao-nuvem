@@ -132,38 +132,77 @@ Resumo da arquitetura:
 | Web/aplicação | **Auto Scaling Group** de EC2 (Node.js) em 2 sub-redes privadas, mín. 2 / máx. 4 | Uma instância por AZ; instâncias com falha são substituídas e o ASG escala por CPU (alvo 60%) |
 | Dados | **DynamoDB** (padrão, via VPC Gateway Endpoint) ou **RDS PostgreSQL Multi-AZ** | DynamoDB replica em 3 AZs; o RDS mantém uma standby síncrona com failover automático |
 | Saída | Um **NAT Gateway por AZ** | A falha de uma AZ não afeta a saída da outra |
+| Monitoramento | **CloudWatch**: dashboard + 2 alarmes | Mostra instâncias saudáveis por AZ, tráfego, latência, erros, CPU e DynamoDB |
 | Segurança | `sg-alb` (80 da internet) → `sg-app` (3000 só do ALB) → `sg-db` (5432 só da aplicação) | EC2 e RDS sem IP público; acesso administrativo pelo SSM Session Manager |
 
 ## Implantação na AWS (CloudFormation)
 
-O template [`infra/cloudformation.yaml`](infra/cloudformation.yaml) cria toda a arquitetura do diagrama. Cada instância, ao iniciar, instala o Node.js, clona este repositório, gera o `.env` e sobe a aplicação como serviço `systemd`.
+O template [`infra/cloudformation.yaml`](infra/cloudformation.yaml) cria toda a arquitetura do diagrama, além do dashboard e dos alarmes de monitoramento. Cada instância, ao iniciar, instala o Node.js 22, clona este repositório, gera o `.env` e sobe a aplicação como serviço `systemd`.
 
-**Pelo console:** CloudFormation → *Criar pilha* → *Fazer upload de um arquivo de modelo* → selecione `infra/cloudformation.yaml` → preencha os parâmetros → *Criar*. Ao final (cerca de 5 a 10 minutos com DynamoDB; mais se usar RDS), abra a saída **AppUrl**.
+### Passo a passo no AWS Academy (Learner Lab)
 
-**Pela CLI (DynamoDB):**
+1. Clique em **Start Lab** e espere a bolinha ao lado de "AWS" ficar verde.
+2. No terminal do laboratório, baixe o template:
+   ```bash
+   curl -fsSLO https://raw.githubusercontent.com/julianoreis27/computacao-nuvem/main/infra/cloudformation.yaml
+   ```
+3. Crie a pilha. O Learner Lab não permite criar IAM Roles, então use o perfil `LabInstanceProfile` que já existe. O comando espera a criação terminar, o que leva de 5 a 10 minutos:
+   ```bash
+   aws cloudformation deploy --region us-east-1 --stack-name estoque --template-file cloudformation.yaml --parameter-overrides InstanceProfileName=LabInstanceProfile
+   ```
+4. Veja os endereços da aplicação (**AppUrl**) e do dashboard (**DashboardUrl**):
+   ```bash
+   aws cloudformation describe-stacks --region us-east-1 --stack-name estoque --query "Stacks[0].Outputs" --output table
+   ```
+5. Aguarde mais 3 a 5 minutos, que é o tempo das instâncias instalarem tudo e passarem no health check, e abra o **AppUrl** no navegador.
+
+Se a criação falhar, este comando mostra o motivo:
+
+```bash
+aws cloudformation describe-stack-events --region us-east-1 --stack-name estoque --query "StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" --output table
+```
+
+Também é possível criar a pilha pelo console: CloudFormation → *Criar pilha* → *Fazer upload de um arquivo de modelo* → em **InstanceProfileName**, informe `LabInstanceProfile`.
+
+### Em uma conta AWS comum
 
 ```bash
 aws cloudformation deploy --template-file infra/cloudformation.yaml --stack-name estoque --capabilities CAPABILITY_IAM
 ```
 
-**Com RDS PostgreSQL Multi-AZ:**
+Com RDS PostgreSQL Multi-AZ em vez de DynamoDB, acrescente `--parameter-overrides DbClient=postgres DbPassword=TroqueEstaSenha123`.
+
+Principais parâmetros: `RepoUrl` (repositório **público** com o código), `InstanceType`, `MinSize`/`DesiredCapacity`/`MaxSize`, `DbClient` (`dynamodb` ou `postgres`), `DbPassword`, `DbMultiAZ`, `InstanceProfileName`.
+
+### Testando o failover da camada web
+
+No console do EC2, encerre uma das duas instâncias `estoque-app`. A aplicação continua respondendo pelo AppUrl, servida pela instância da outra AZ. No dashboard, o gráfico "Instâncias saudáveis por AZ" mostra a queda, o alarme de instância com falha dispara e, em poucos minutos, o Auto Scaling cria uma substituta.
+
+## Monitoramento (CloudWatch)
+
+A pilha cria o dashboard **estoque-estoque** no CloudWatch (link na saída **DashboardUrl**) com:
+
+- requisições por minuto no Load Balancer;
+- tempo de resposta médio e p95;
+- códigos HTTP 2xx, 4xx e 5xx;
+- **instâncias saudáveis e com falha por zona de disponibilidade**, que evidencia o HA;
+- instâncias em serviço e capacidade desejada do Auto Scaling Group;
+- CPU das instâncias, com a linha do alvo de escala (60%);
+- leituras e gravações no DynamoDB;
+- estado dos alarmes.
+
+Alarmes: **instância não saudável** (alguma instância falhando em `/api/health` por 2 minutos) e **erros 5xx** (5 ou mais em 5 minutos).
+
+Para gerar tráfego e ver os gráficos se mexendo, rode no terminal do laboratório (troque pelo seu AppUrl):
 
 ```bash
-aws cloudformation deploy --template-file infra/cloudformation.yaml --stack-name estoque --capabilities CAPABILITY_IAM --parameter-overrides DbClient=postgres DbPassword=TroqueEstaSenha123
+for i in $(seq 1 300); do curl -s -o /dev/null http://SEU-APP-URL/api/produtos; done
 ```
 
-**AWS Academy (Learner Lab):** o laboratório não permite criar IAM Roles. Informe o perfil já existente:
+## Custos
+
+NAT Gateways, Load Balancer e IPs públicos são cobrados **por hora, mesmo quando o laboratório está parado**. São cerca de US$ 0,16/hora, ou uns US$ 4 por dia. No Learner Lab, com crédito de US$ 50, **exclua a pilha depois de testar** e crie de novo perto da apresentação, o que leva uns 10 minutos:
 
 ```bash
-aws cloudformation deploy --template-file infra/cloudformation.yaml --stack-name estoque --parameter-overrides InstanceProfileName=LabInstanceProfile
-```
-
-Principais parâmetros: `RepoUrl` (repositório **público** com o código), `InstanceType`, `MinSize`/`DesiredCapacity`/`MaxSize`, `DbClient` (`dynamodb` ou `postgres`), `DbPassword`, `DbMultiAZ`.
-
-**Testando o failover da camada web:** no console do EC2, encerre uma das duas instâncias. A aplicação continua respondendo pelo endereço do ALB, servida pela instância da outra AZ, e o Auto Scaling cria uma substituta em poucos minutos.
-
-**Custos:** NAT Gateways, ALB e RDS Multi-AZ são cobrados por hora. Exclua a pilha ao terminar:
-
-```bash
-aws cloudformation delete-stack --stack-name estoque
+aws cloudformation delete-stack --region us-east-1 --stack-name estoque
 ```
