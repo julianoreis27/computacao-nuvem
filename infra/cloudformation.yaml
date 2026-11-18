@@ -1,0 +1,489 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Estoque do Supermercado - infraestrutura com alta disponibilidade (Multi-AZ):
+  VPC em 2 zonas de disponibilidade, Application Load Balancer, Auto Scaling Group
+  de EC2 (Node.js) em sub-redes privadas, DynamoDB e, opcionalmente, RDS PostgreSQL Multi-AZ.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Aplicação }
+        Parameters: [RepoUrl, InstanceType, LatestAmiId, InstanceProfileName]
+      - Label: { default: Auto Scaling (camada web) }
+        Parameters: [MinSize, DesiredCapacity, MaxSize]
+      - Label: { default: Banco de dados }
+        Parameters: [DbClient, DbUsername, DbPassword, DbInstanceClass, DbMultiAZ]
+
+Parameters:
+  RepoUrl:
+    Type: String
+    Default: https://github.com/julianoreis27/computacao-nuvem.git
+    Description: Repositório Git (público) com o código da aplicação.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small, t3.medium]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI Amazon Linux 2023 mais recente (resolvida automaticamente).
+  InstanceProfileName:
+    Type: String
+    Default: ''
+    Description: >-
+      Deixe vazio para criar uma IAM Role. No AWS Academy Learner Lab, informe LabInstanceProfile.
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    Description: Mínimo de instâncias (2 = uma por AZ, garante HA).
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 2
+  MaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 2
+  DbClient:
+    Type: String
+    Default: dynamodb
+    AllowedValues: [dynamodb, postgres]
+    Description: Banco usado pela aplicação. "postgres" cria também um RDS PostgreSQL.
+  DbUsername:
+    Type: String
+    Default: estoque
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]{2,15}'
+  DbPassword:
+    Type: String
+    NoEcho: true
+    Default: ''
+    AllowedPattern: '^$|[a-zA-Z0-9]{8,41}'
+    ConstraintDescription: 8 a 41 caracteres alfanuméricos (obrigatório se DbClient=postgres).
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t4g.micro, db.t4g.small]
+  DbMultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: RDS com réplica standby síncrona em outra AZ.
+
+Rules:
+  SenhaObrigatoriaParaPostgres:
+    RuleCondition: !Equals [!Ref DbClient, postgres]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DbPassword, '']]
+        AssertDescription: Informe DbPassword quando DbClient=postgres.
+
+Conditions:
+  UsePostgres: !Equals [!Ref DbClient, postgres]
+  CreateRole: !Equals [!Ref InstanceProfileName, '']
+
+Resources:
+  # ------------------------------------------------------------------ Rede
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-vpc' }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-igw' }]
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-publica-a' }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-publica-b' }]
+
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-app-a' }]
+
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-app-b' }]
+
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-db-a' }]
+
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.22.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-db-b' }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-rt-publica' }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+
+  PublicSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  # Um NAT Gateway por AZ: a falha de uma AZ não derruba a saída da outra.
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties: { Domain: vpc }
+
+  NatEipB:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties: { Domain: vpc }
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nat-a' }]
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nat-b' }]
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-rt-privada-a' }]
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-rt-privada-b' }]
+
+  PrivateDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+
+  AppSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetA, RouteTableId: !Ref PrivateRouteTableA }
+
+  AppSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetB, RouteTableId: !Ref PrivateRouteTableB }
+
+  DbSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnetA, RouteTableId: !Ref PrivateRouteTableA }
+
+  DbSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnetB, RouteTableId: !Ref PrivateRouteTableB }
+
+  # Tráfego para o DynamoDB sai pela rede da AWS, sem passar pelo NAT.
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB]
+
+  # ------------------------------------------------------- Security Groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP aberto para a internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-sg-alb' }]
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App - porta 3000 somente a partir do ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-sg-app' }]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UsePostgres
+    Properties:
+      GroupDescription: RDS - porta 5432 somente a partir da aplicacao
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSecurityGroup }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-sg-db' }]
+
+  # ---------------------------------------------------------- Banco de dados
+  ProdutosTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Produtos'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: id, AttributeType: S }]
+      KeySchema: [{ AttributeName: id, KeyType: HASH }]
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: UsePostgres
+    Properties:
+      DBSubnetGroupDescription: Sub-redes privadas de banco (2 AZs)
+      SubnetIds: [!Ref DbSubnetA, !Ref DbSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Condition: UsePostgres
+    Metadata:
+      # Senha via parâmetro NoEcho para manter o exemplo simples.
+      # Em produção, prefira o AWS Secrets Manager.
+      cfn-lint: { config: { ignore_checks: [W1011] } }
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: '17.6'
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: estoque
+      MasterUsername: !Ref DbUsername
+      MasterUserPassword: !Ref DbPassword
+      MultiAZ: !Ref DbMultiAZ
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+
+  # --------------------------------------------------------------- IAM
+  AppRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: acesso-tabela-produtos
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ProdutosTable.Arn
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: CreateRole
+    Properties:
+      Roles: [!Ref AppRole]
+
+  # ------------------------------------------------- Camada web (HA)
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 3000
+      TargetType: instance
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroup }
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !If [CreateRole, !Ref AppInstanceProfile, !Ref InstanceProfileName]
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions: { HttpTokens: required }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-app' }]
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              dnf install -y nodejs git
+              useradd --system --home /opt/estoque estoque || true
+              rm -rf /opt/estoque
+              git clone --depth 1 ${RepoUrl} /opt/estoque
+              cd /opt/estoque
+              npm ci --omit=dev
+              cat > .env <<EOF
+              PORT=3000
+              DB_CLIENT=${DbClient}
+              AUTO_CREATE_TABLE=${AutoCreate}
+              AWS_REGION=${AWS::Region}
+              DYNAMODB_TABLE=${ProdutosTable}
+              DATABASE_URL=${DatabaseUrl}
+              DATABASE_SSL=true
+              EOF
+              chown -R estoque:estoque /opt/estoque
+              chmod 600 .env
+              cat > /etc/systemd/system/estoque.service <<EOF
+              [Unit]
+              Description=Estoque do Supermercado
+              After=network-online.target
+              [Service]
+              User=estoque
+              WorkingDirectory=/opt/estoque
+              ExecStart=/usr/bin/node src/server.js
+              Restart=always
+              RestartSec=5
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              systemctl daemon-reload
+              systemctl enable --now estoque
+            - AutoCreate: !If [UsePostgres, 'true', 'false']
+              DatabaseUrl: !If
+                - UsePostgres
+                - !Sub 'postgres://${DbUsername}:${DbPassword}@${Database.Endpoint.Address}:5432/estoque'
+                - ''
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [PrivateDefaultRouteA, PrivateDefaultRouteB, AppSubnetARouteTable, AppSubnetBRouteTable]
+    Properties:
+      VPCZoneIdentifier: [!Ref AppSubnetA, !Ref AppSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      DesiredCapacity: !Ref DesiredCapacity
+      MaxSize: !Ref MaxSize
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-app', PropagateAtLaunch: true }
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60
+
+Outputs:
+  AppUrl:
+    Description: Endereço da aplicação (DNS do Application Load Balancer)
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+  DynamoDbTable:
+    Value: !Ref ProdutosTable
+  RdsEndpoint:
+    Condition: UsePostgres
+    Value: !GetAtt Database.Endpoint.Address

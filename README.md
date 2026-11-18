@@ -29,6 +29,8 @@ scripts/seed.js                 # dados de exemplo
 scripts/criar-tabela-dynamodb.js
 test/api.test.js                # testes de integração (DynamoDB e PostgreSQL)
 docker-compose.yml              # DynamoDB Local e PostgreSQL para desenvolvimento
+infra/cloudformation.yaml       # infraestrutura AWS com HA Multi-AZ (ALB + Auto Scaling)
+docs/arquitetura.drawio         # diagrama de arquitetura (draw.io)
 ```
 
 ## API REST
@@ -115,32 +117,53 @@ Para testar também contra PostgreSQL:
 TEST_DATABASE_URL=postgres://estoque:estoque@localhost:5432/estoque npm test
 ```
 
-## Implantação na AWS
+## Arquitetura na AWS (alta disponibilidade Multi-AZ)
 
-### Opção A: DynamoDB
+O diagrama está em [`docs/arquitetura.drawio`](docs/arquitetura.drawio). Abra em https://app.diagrams.net (*Arquivo → Abrir de → Dispositivo*) ou no draw.io Desktop. Ele tem duas páginas:
 
-1. Crie a tabela (ou deixe `AUTO_CREATE_TABLE=true`):
-   ```bash
-   aws dynamodb create-table --table-name Produtos \
-     --attribute-definitions AttributeName=id,AttributeType=S \
-     --key-schema AttributeName=id,KeyType=HASH \
-     --billing-mode PAY_PER_REQUEST
-   ```
-2. Dê à instância/serviço uma **IAM Role** com permissão `dynamodb:GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Scan` e `DescribeTable` na tabela (e `CreateTable` se usar a criação automática).
-3. Variáveis de ambiente: `DB_CLIENT=dynamodb`, `AWS_REGION`, `DYNAMODB_TABLE=Produtos`. **Não** defina `DYNAMODB_ENDPOINT` nem chaves de acesso; a role fornece as credenciais.
+1. **Arquitetura AWS (HA Multi-AZ)**: VPC, sub-redes, Load Balancer, Auto Scaling, bancos e security groups.
+2. **Estrutura da aplicação**: front-end, rotas da API, validação, repositórios e modelo de dados.
 
-### Opção B: RDS PostgreSQL
+Resumo da arquitetura:
 
-1. Crie uma instância RDS PostgreSQL (versão 13 ou superior) e um banco `estoque`.
-2. Libere a porta 5432 no *security group* do RDS **apenas** para o security group da aplicação.
-3. Variáveis de ambiente: `DB_CLIENT=postgres`, `DATABASE_URL=postgres://USUARIO:SENHA@ENDPOINT:5432/estoque`, `DATABASE_SSL=true`.
+| Camada | Recursos | Como garante disponibilidade |
+|---|---|---|
+| Entrada | Internet Gateway → **Application Load Balancer** nas 2 sub-redes públicas | O ALB tem nós em 2 AZs e verifica `/api/health` a cada 15 s |
+| Web/aplicação | **Auto Scaling Group** de EC2 (Node.js) em 2 sub-redes privadas, mín. 2 / máx. 4 | Uma instância por AZ; instâncias com falha são substituídas e o ASG escala por CPU (alvo 60%) |
+| Dados | **DynamoDB** (padrão, via VPC Gateway Endpoint) ou **RDS PostgreSQL Multi-AZ** | DynamoDB replica em 3 AZs; o RDS mantém uma standby síncrona com failover automático |
+| Saída | Um **NAT Gateway por AZ** | A falha de uma AZ não afeta a saída da outra |
+| Segurança | `sg-alb` (80 da internet) → `sg-app` (3000 só do ALB) → `sg-db` (5432 só da aplicação) | EC2 e RDS sem IP público; acesso administrativo pelo SSM Session Manager |
 
-### Onde rodar a aplicação
+## Implantação na AWS (CloudFormation)
 
-Qualquer serviço que execute Node.js serve, por exemplo:
+O template [`infra/cloudformation.yaml`](infra/cloudformation.yaml) cria toda a arquitetura do diagrama. Cada instância, ao iniciar, instala o Node.js, clona este repositório, gera o `.env` e sobe a aplicação como serviço `systemd`.
 
-- **Elastic Beanstalk** (plataforma Node.js): compacte o projeto sem `node_modules` e envie; o comando `npm start` já está configurado.
-- **EC2**: `git clone`, `npm install --omit=dev`, configure o `.env` e rode com `pm2` ou `systemd` atrás de um Nginx.
-- **App Runner / ECS**: use a imagem oficial `node:22-alpine` e execute `npm start`.
+**Pelo console:** CloudFormation → *Criar pilha* → *Fazer upload de um arquivo de modelo* → selecione `infra/cloudformation.yaml` → preencha os parâmetros → *Criar*. Ao final (cerca de 5 a 10 minutos com DynamoDB; mais se usar RDS), abra a saída **AppUrl**.
 
-Lembre-se de expor a porta definida em `PORT` (padrão 3000).
+**Pela CLI (DynamoDB):**
+
+```bash
+aws cloudformation deploy --template-file infra/cloudformation.yaml --stack-name estoque --capabilities CAPABILITY_IAM
+```
+
+**Com RDS PostgreSQL Multi-AZ:**
+
+```bash
+aws cloudformation deploy --template-file infra/cloudformation.yaml --stack-name estoque --capabilities CAPABILITY_IAM --parameter-overrides DbClient=postgres DbPassword=TroqueEstaSenha123
+```
+
+**AWS Academy (Learner Lab):** o laboratório não permite criar IAM Roles. Informe o perfil já existente:
+
+```bash
+aws cloudformation deploy --template-file infra/cloudformation.yaml --stack-name estoque --parameter-overrides InstanceProfileName=LabInstanceProfile
+```
+
+Principais parâmetros: `RepoUrl` (repositório **público** com o código), `InstanceType`, `MinSize`/`DesiredCapacity`/`MaxSize`, `DbClient` (`dynamodb` ou `postgres`), `DbPassword`, `DbMultiAZ`.
+
+**Testando o failover da camada web:** no console do EC2, encerre uma das duas instâncias. A aplicação continua respondendo pelo endereço do ALB, servida pela instância da outra AZ, e o Auto Scaling cria uma substituta em poucos minutos.
+
+**Custos:** NAT Gateways, ALB e RDS Multi-AZ são cobrados por hora. Exclua a pilha ao terminar:
+
+```bash
+aws cloudformation delete-stack --stack-name estoque
+```
